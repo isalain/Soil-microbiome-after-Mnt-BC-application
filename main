@@ -1,0 +1,453 @@
+# Soil microbiome after Mnt-BC application
+# Load required packages
+library(tidyverse)   
+library(readxl)      
+library(ggpubr)      
+library(vegan)      
+library(phyloseq)    
+library(igraph)      
+library(ggsci)       
+library(patchwork)  
+
+# ---- Load Data ----
+# Load metadata and ASV tables from Excel
+metadata <- read_excel("data.xlsx", sheet = "metadata")
+asv_table <- read_excel("data.xlsx", sheet = "ASVs")
+taxonomy <- read_excel("data.xlsx", sheet = "Taxonomy")
+
+# ---- Prepare Phyloseq Object ----
+# Convert data to matrices and create phyloseq object
+asv_matrix <- as.matrix(asv_table %>% column_to_rownames("ASV"))
+tax_matrix <- as.matrix(taxonomy %>% column_to_rownames("ASV"))
+metadata_df <- metadata %>% column_to_rownames("SampleID")
+
+# Create phyloseq components
+ASV <- otu_table(asv_matrix, taxa_are_rows = TRUE)
+TAX <- tax_table(tax_matrix)
+SAMPLES <- sample_data(metadata_df)
+
+# Create and rarefy phyloseq object
+bact_phylo <- phyloseq(ASV, TAX, SAMPLES)
+set.seed(123)
+min_depth <- min(sample_sums(bact_phylo))
+bact_rar <- rarefy_even_depth(bact_phylo, min_depth)
+
+# ---- Alpha Diversity Analysis ----
+# Calculate diversity metrics
+alpha_div <- estimate_richness(bact_rar, measures = c("Shannon", "Observed"))
+alpha_div_with_metadata <- cbind(metadata_df, alpha_div)
+
+# Number of colors needed for plotting
+n_colors <- length(unique(metadata_df$Day))
+
+# Create Shannon diversity boxplot
+shannon_plot <- ggboxplot(
+  alpha_div_with_metadata, 
+  x = "Day", 
+  y = "Shannon",
+  add = "jitter",
+  color = "Day", 
+  palette = get_palette("npg", n_colors), 
+  ylab = "Shannon index", 
+  xlab = "Day"
+) + 
+  theme_bw() + 
+  stat_compare_means()
+
+# Create ASV richness boxplot
+richness_plot <- ggboxplot(
+  alpha_div_with_metadata, 
+  x = "Day", 
+  y = "Observed",
+  add = "jitter",
+  color = "Day", 
+  palette = get_palette("npg", n_colors), 
+  ylab = "Number of ASVs", 
+  xlab = "Day"
+) + 
+  theme_bw() + 
+  stat_compare_means()
+
+# ---- Beta Diversity Analysis ----
+# Calculate Bray-Curtis distances and perform PCoA
+bact_dist <- distance(bact_rar, method = "bray")
+bact_pcoa <- ordinate(bact_rar, "PCoA", "bray")
+
+# Extract PCoA results
+pcoa_points <- as.data.frame(bact_pcoa$vectors) 
+pcoa_points <- cbind(pcoa_points, metadata)
+eigenvalues <- bact_pcoa$values$Eigenvalues
+
+# Create PCoA plot
+pcoa_plot <- ggplot(pcoa_points, aes(x = Axis.1, y = Axis.2, color = Day)) +
+  geom_point(alpha = 0.7, size = 4) + 
+  labs(
+    x = paste0("PCoA 1 (", format(100 * eigenvalues[1] / sum(eigenvalues), digits = 4), "%)"),
+    y = paste0("PCoA 2 (", format(100 * eigenvalues[2] / sum(eigenvalues), digits = 4), "%)"),
+    title = "PCoA of Bacterial Community"
+  ) +
+  theme_bw() + 
+  scale_color_npg()
+
+# MRPP test for group differences
+mrpp_result <- with(metadata, mrpp(bact_dist, Day))
+
+# ---- Taxonomic Composition ----
+# Aggregate at phylum level and calculate relative abundance
+phylum_glom <- tax_glom(bact_phylo, taxrank = "Phylum")
+phylum_rel <- transform_sample_counts(phylum_glom, function(x) x / sum(x))
+melted_phylum <- psmelt(phylum_rel)
+
+# Get top 10 phyla by mean abundance
+top_phyla <- melted_phylum %>%
+  group_by(Phylum) %>%
+  summarise(mean_abundance = mean(Abundance)) %>%
+  arrange(desc(mean_abundance)) %>%
+  top_n(10, mean_abundance) %>%
+  pull(Phylum)
+
+# Prepare data for plotting
+melted_phylum <- melted_phylum %>%
+  mutate(Phylum = if_else(Phylum %in% top_phyla, as.character(Phylum), "Other"))
+
+# Create phylum composition barplot
+phylum_plot <- ggplot(melted_phylum, aes(x = Sample, y = Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(
+    x = "Sample", 
+    y = "Relative Abundance", 
+    title = "Top 10 Phyla in Bacterial Community Composition"
+  )
+
+# ---- Network Analysis ----
+# Filter low abundance ASVs
+filtered_data <- subset(melted_phylum, Abundance > 0.0001)
+
+# Define time periods
+early_samples <- c("initial_soil", "Day_14")
+late_samples <- c("Day_30", "Day_60")
+
+# Split data by time period
+early_data <- filtered_data %>% filter(Day %in% early_samples)
+late_data <- filtered_data %>% filter(Day %in% late_samples)
+
+# Function to create co-occurrence network
+create_network <- function(data, threshold = 0.3) {
+  # Create abundance matrix
+  abundance_matrix <- data %>%
+    dplyr::select(OTU, Sample, Abundance) %>%
+    pivot_wider(
+      names_from = Sample, 
+      values_from = Abundance, 
+      values_fill = 0
+    )
+  
+  otu_names <- abundance_matrix$OTU
+  abundance_matrix <- abundance_matrix %>% dplyr::select(-OTU)
+  abundance_matrix <- as.matrix(abundance_matrix)
+  rownames(abundance_matrix) <- otu_names
+  
+  # Calculate correlations
+  co_occurrence <- cor(t(abundance_matrix), method = "pearson")
+  co_occurrence_thresholded <- co_occurrence
+  co_occurrence_thresholded[co_occurrence_thresholded < threshold] <- 0
+  
+  # Create graph
+  graph <- make_empty_graph(n = nrow(co_occurrence_thresholded), directed = FALSE)
+  V(graph)$name <- rownames(co_occurrence_thresholded)
+  
+  # Add edges
+  edge_list <- which(co_occurrence_thresholded > 0, arr.ind = TRUE)
+  edge_list <- edge_list[edge_list[,1] < edge_list[,2], , drop = FALSE]
+  
+  if(nrow(edge_list) > 0) {
+    edges <- data.frame(
+      from = V(graph)$name[edge_list[,1]],
+      to = V(graph)$name[edge_list[,2]],
+      weight = co_occurrence_thresholded[edge_list]
+    )
+    graph <- add_edges(
+      graph, 
+      edges = as.vector(t(edges[,1:2])), 
+      attr = list(weight = edges$weight)
+    )
+  }
+  
+  # Add taxonomic information
+  otu_phylum <- data %>%
+    dplyr::select(OTU, Phylum) %>%
+    distinct()
+  
+  V(graph)$phylum <- otu_phylum$Phylum[match(V(graph)$name, otu_phylum$OTU)]
+  V(graph)$phylum[is.na(V(graph)$phylum)] <- "Unknown"
+  
+  # Calculate network metrics
+  metrics <- list(
+    graph = graph,
+    closeness = closeness(graph),
+    betweenness = betweenness(graph),
+    pagerank = page_rank(graph)$vector,
+    hubscore = hub_score(graph)$vector,
+    modularity = modularity(graph, membership(walktrap.community(graph))),
+    communities = walktrap.community(graph)
+  )
+  
+  return(metrics)
+}
+
+# Create networks for both periods
+early_net <- create_network(early_data)
+late_net <- create_network(late_data)
+
+# Create consistent color scheme
+all_phyla <- unique(c(V(early_net$graph)$phylum, V(late_net$graph)$phylum))
+phylum_colors <- setNames(
+  colorRampPalette(c(
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+  ))(length(all_phyla)),
+  all_phyla
+)
+
+# Function to prepare network for export
+prepare_network_for_export <- function(network, period) {
+  g <- network$graph
+  
+  # Add period identifier
+  V(g)$period <- period
+  
+  # Set node attributes
+  V(g)$color <- phylum_colors[V(g)$phylum]
+  V(g)$size <- 5
+  V(g)$label <- V(g)$name
+  
+  # Add network metrics as node attributes
+  V(g)$closeness <- network$closeness
+  V(g)$betweenness <- network$betweenness
+  V(g)$pagerank <- network$pagerank
+  V(g)$hubscore <- network$hubscore
+  
+  # Set edge attributes
+  if(ecount(g) > 0) {
+    E(g)$width <- E(g)$weight * 5
+    E(g)$color <- "gray50"
+  }
+  
+  return(g)
+}
+
+# Prepare and export networks
+early_export <- prepare_network_for_export(early_net, "early")
+late_export <- prepare_network_for_export(late_net, "late")
+write_graph(early_export, "early_network.gml", format = "gml")
+write_graph(late_export, "late_network.gml", format = "gml")
+
+# Prepare network metrics comparison
+create_metric_comparison <- function(early_net, late_net, metric_name) {
+  early_vals <- early_net[[metric_name]]
+  late_vals <- late_net[[metric_name]]
+  
+  data.frame(
+    Period = rep(c("Early", "Late"), c(length(early_vals), length(late_vals))),
+    Value = c(early_vals, late_vals),
+    Metric = metric_name
+  )
+}
+
+# Combine all metrics
+metrics_data <- bind_rows(
+  create_metric_comparison(early_net, late_net, "closeness"),
+  create_metric_comparison(early_net, late_net, "betweenness"),
+  create_metric_comparison(early_net, late_net, "pagerank"),
+  create_metric_comparison(early_net, late_net, "hubscore")
+)
+
+# Create comparison boxplot
+metrics_data$Period <- factor(metrics_data$Period, levels = c("Late", "Early"))
+
+metrics_plot <- ggplot(metrics_data, aes(x = Value, y = Period, fill = Period)) +
+  geom_boxplot() +
+  facet_wrap(~Metric, scales = "free_x") +
+  theme_bw() +
+  scale_fill_manual(values = c("Early" = "#3498db", "Late" = "#e74c3c")) +
+  labs(
+    title = "Comparison of Network Metrics",
+    y = "Period",
+    x = "Value"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    strip.background = element_rect(fill = "#f0f0f0"),
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+# ---- Cohesion Analysis ----
+# Calculate cohesion metrics
+
+# Create abundance matrix for correlation calculations
+abundance_matrix <- melted_phylum %>%
+  dplyr::select(OTU, Sample, Abundance) %>%
+  pivot_wider(
+    names_from = Sample, 
+    values_from = Abundance,
+    values_fill = 0
+  ) %>%
+  as.data.frame()
+
+rownames(abundance_matrix) <- abundance_matrix$OTU
+abundance_matrix <- abundance_matrix[,-1]  # Remove OTU column
+
+# Calculate correlation matrix
+cor_matrix <- cor(t(abundance_matrix))
+
+# Calculate connectedness per ASV
+connectedness_pos <- rowMeans(cor_matrix * (cor_matrix > 0), na.rm = TRUE)
+connectedness_neg <- rowMeans(cor_matrix * (cor_matrix < 0), na.rm = TRUE)
+
+# Function to calculate cohesion for a single sample
+calculate_sample_cohesion <- function(sample_abundances, conn_pos, conn_neg) {
+  cohesion_pos <- sum(sample_abundances * conn_pos)
+  cohesion_neg <- sum(sample_abundances * conn_neg)
+  
+  return(c(cohesion_pos, cohesion_neg))
+}
+
+# Calculate cohesion for each sample
+sample_cohesion <- data.frame(
+  Sample = colnames(abundance_matrix),
+  Cohesion_pos = NA,
+  Cohesion_neg = NA
+)
+
+for(i in 1:ncol(abundance_matrix)) {
+  cohesion_values <- calculate_sample_cohesion(
+    abundance_matrix[,i],
+    connectedness_pos,
+    connectedness_neg
+  )
+  sample_cohesion$Cohesion_pos[i] <- cohesion_values[1]
+  sample_cohesion$Cohesion_neg[i] <- cohesion_values[2]
+}
+
+# Add metadata information
+sample_cohesion <- sample_cohesion %>%
+  left_join(
+    melted_phylum %>% 
+      dplyr::select(Sample, Day) %>% 
+      unique(),
+    by = "Sample"
+  )
+
+# Calculate additional metrics
+sample_cohesion <- sample_cohesion %>%
+  mutate(
+    # Negative to positive ratio (absolute values)
+    Neg_Pos_Ratio = abs(Cohesion_neg) / Cohesion_pos,
+    # Total cohesion (sum of positive and absolute negative)
+    Total_Cohesion = Cohesion_pos + abs(Cohesion_neg)
+  )
+
+# Reshape data for plotting
+sample_cohesion_long <- sample_cohesion %>%
+  dplyr::select(Sample, Day, Cohesion_pos, Cohesion_neg) %>%
+  pivot_longer(
+    cols = c(Cohesion_pos, Cohesion_neg),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Create cohesion boxplot
+cohesion_plot <- ggplot(sample_cohesion_long, aes(x = Day, y = Value, fill = Metric)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(
+    y = "Cohesion Value", 
+    title = "Sample-level Cohesion Values by Day"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(.~Metric)
+
+# Calculate means and standard errors by time period
+cohesion_time <- sample_cohesion_long %>%
+  mutate(
+    # Clean up Metric names
+    Metric = case_when(
+      Metric == "Cohesion_pos" ~ "Positive Cohesion",
+      Metric == "Cohesion_neg" ~ "Negative Cohesion"
+    ),
+    # Create factor for proper ordering
+    Day = factor(
+      Day, 
+      levels = c("initial_soil", "Day_14", "Day_30", "Day_60"),
+      labels = c("Initial Soil", "Day 14", "Day 30", "Day 60")
+    )
+  ) %>%
+  group_by(Day, Metric) %>%
+  summarise(
+    mean_value = mean(Value),
+    se = sd(Value)/sqrt(n()),
+    .groups = 'drop'
+  )
+
+# Create temporal cohesion plot
+cohesion_time_plot <- ggplot(cohesion_time, aes(x = Day, y = mean_value, group = 1)) +
+  geom_line(size = 1) +
+  geom_point(size = 4) +
+  geom_errorbar(
+    aes(ymin = mean_value - se, ymax = mean_value + se), 
+    width = 0.2
+  ) +
+  facet_grid(Metric ~ ., scales = "free_y") +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white"),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    x = "Time Period",
+    y = "Cohesion Value",
+    title = "Temporal Changes in Community Cohesion"
+  )
+
+# ---- Combined Plots ----
+# Create combined plot of alpha and beta diversity
+diversity_plots <- ggarrange(
+  richness_plot, 
+  shannon_plot, 
+  pcoa_plot,
+  nrow = 1, 
+  ncol = 3, 
+  common.legend = TRUE
+)
+
+# Print network statistics
+cat("\nNetwork Statistics:\n")
+cat("Early network:\n")
+cat("- Vertices:", vcount(early_net$graph), "\n")
+cat("- Edges:", ecount(early_net$graph), "\n")
+cat("- Modularity:", early_net$modularity, "\n")
+cat("- Number of communities:", length(unique(membership(early_net$communities))), "\n")
+
+cat("\nLate network:\n")
+cat("- Vertices:", vcount(late_net$graph), "\n")
+cat("- Edges:", ecount(late_net$graph), "\n")
+cat("- Modularity:", late_net$modularity, "\n")
+cat("- Number of communities:", length(unique(membership(late_net$communities))), "\n")
+
+# ---- Save Results ----
+write.csv(sample_cohesion, "sample_cohesion_results.csv", row.names = FALSE)
+
+# Save plots if needed
+ggsave("diversity_plots.pdf", plot = diversity_plots, width = 12, height = 4)
+ggsave("phylum_composition.pdf", plot = phylum_plot, width = 10, height = 6)
+ggsave("network_metrics.pdf", plot = metrics_plot, width = 10, height = 6)
+ggsave("cohesion_boxplot.pdf", plot = cohesion_plot, width = 10, height = 6)
+ggsave("cohesion_temporal.pdf", plot = cohesion_time_plot, width = 8, height = 6)
